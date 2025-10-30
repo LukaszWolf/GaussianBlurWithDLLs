@@ -33,6 +33,24 @@ namespace GaussianBlur
             InitializeComponent(); // łączy z XAML
         }
 
+
+        private int[] getAmountOfLinesForThreadVector(int imageHeight, int numOfThreads)
+        {
+            if (numOfThreads <= 0)
+                throw new ArgumentOutOfRangeException(nameof(numOfThreads));
+
+            var lines = new int[numOfThreads];
+
+            // bazowa liczba linii i reszta do „rozdania”
+            int baseLines = Math.DivRem(imageHeight, numOfThreads, out int rest);
+
+            for (int i = 0; i < numOfThreads; i++)
+                lines[i] = baseLines + (i < rest ? 1 : 0);
+
+            tbLines.Text = $"[{string.Join(", ", lines)}]";
+            return lines;
+        }
+
         private void btnChooseFolder_Click(object sender, RoutedEventArgs e)
         {
 
@@ -54,6 +72,27 @@ namespace GaussianBlur
                                MessageBoxButton.OK, MessageBoxImage.Information);
                 // jeśli chcesz gdzieś pokazać wynik w UI, np. w TextBlock:
                 tbFilePath.Text = $"Folder: {_imagesFolder}  |  Plików: {_imageCount}";
+
+                if (_imageCount > 0)
+                {
+                    //  policz linie od razu po wybraniu folderu
+                    int numOfThreads = Environment.ProcessorCount;
+
+                    // otwórz pierwszy obraz, żeby znać wysokość
+                    var firstImage = Directory.EnumerateFiles(_imagesFolder, "*.*")
+                                              .FirstOrDefault(f => ImageExts.Contains(Path.GetExtension(f)));
+
+                    if (firstImage != null)
+                    {
+                        using var bmp = new System.Drawing.Bitmap(firstImage);
+                        getAmountOfLinesForThreadVector(bmp.Height, numOfThreads);
+                    }
+                }
+                else
+                {
+                    tbLines.Text = "Brak obrazów w folderze.";
+                }
+
             }
         }
 
@@ -95,7 +134,9 @@ namespace GaussianBlur
 
             using (var bmp = new System.Drawing.Bitmap(firstImage))
             {
+                //int numOfThreads = Environment.ProcessorCount;
                 var rect = new System.Drawing.Rectangle(0, 0, bmp.Width, bmp.Height);
+                //int[] lines = getAmountOfLinesForThreadVector(bmp.Height,numOfThreads);
                 var data = bmp.LockBits(rect,
                     System.Drawing.Imaging.ImageLockMode.ReadWrite,
                     System.Drawing.Imaging.PixelFormat.Format32bppArgb);

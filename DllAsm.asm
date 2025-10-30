@@ -2,43 +2,40 @@ option casemap:none
 .code
 
 ; void MyProc1(void* imagePtr, int width, int height, int stride)
+; RCX = imagePtr, EDX = width, R8D = height, R9D = stride (bytes/row)
 MyProc1 PROC imagePtr:QWORD, imgWidth:DWORD, imgHeight:DWORD, imgStride:DWORD
 
-    ; RCX = imagePtr
-    ; EDX = width
-    ; R8D = height
-    ; R9D = stride
-
-    ; --- ZACHOWAJ rejestry, których dotkniemy ---
     push rbx
     push rsi
     push rdi
 
-    mov rsi, rcx            ; rsi = imagePtr
-    mov ebx, edx            ; ebx = width
-    mov edi, r8d            ; edi = height
-    mov r10d, r9d           ; r10d = stride (bytes per row)
+    mov     rsi, rcx        ; base ptr
+    mov     ebx, edx        ; width
+    mov     edi, r8d        ; height
+    mov     r10d, r9d       ; stride
 
-    ; przejdŸ do œrodka obrazu
-    mov eax, edi
-    shr eax, 1              ; height / 2
-    imul eax, r10d          ; eax = stride * (height/2)
-    add rsi, rax            ; rsi += offset (po³owa w dó³)
+    ; y = height / 2  -> start of middle row
+    mov     eax, edi
+    shr     eax, 1
+    imul    eax, r10d
+    add     rsi, rax
 
-    mov eax, ebx
-    shr eax, 1              ; width / 2
-    imul eax, 4             ; 4 bytes per pixel
-    add rsi, rax            ; rsi += offset (po³owa w bok)
+    ; BGRA = AA 00 AA FF (fully opaque) -> dword LE = 0xFFAA00AA
+    mov     eax, 0FFAA00AAh
 
-    ; ustaw piksel na czerwony (BGRA = FF 00 00 FF)
-    mov BYTE PTR [rsi],   0AAh
-    mov BYTE PTR [rsi+1], 00h
-    mov BYTE PTR [rsi+2], 0AAh
-    mov BYTE PTR [rsi+3], 0AAh
+row_loop:
+    test    ebx, ebx
+    jz      row_done
 
-    pop rdi
-    pop rsi
-    pop rbx
+    mov     dword ptr [rsi], eax    ; write pixel
+    add     rsi, 4                  ; next pixel
+    dec     ebx
+    jmp     row_loop
+
+row_done:
+    pop     rdi
+    pop     rsi
+    pop     rbx
     ret
 
 MyProc1 ENDP
