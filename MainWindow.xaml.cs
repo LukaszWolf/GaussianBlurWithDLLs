@@ -1,59 +1,82 @@
-﻿using System.IO;
+﻿using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
-using System.Windows;         // ważne dla Window
+using System.Threading.Tasks;
+using System.Windows;
 using System.Windows.Controls;
-using System.Windows.Media;
-using System.Xml; // jeśli masz zdarzenia z TextBox itd.
 using MessageBox = System.Windows.MessageBox;
-using WinForms = System.Windows.Forms; // alias
-
+using WinForms = System.Windows.Forms;
 
 namespace GaussianBlur
 {
     public partial class MainWindow : Window
     {
-        Boolean asmChoice = false;
-        Boolean cChoice = false;
-        int result;
+        private bool asmChoice = true;  // jeśli masz przełączniki C/ASM, ustawisz to przy kliknięciu
         private string _imagesFolder = string.Empty;
         private int _imageCount = 0;
 
-        // rozszerzenia jakie uznajemy za obraz
+        // Obsługiwane rozszerzenia obrazów
         private static readonly HashSet<string> ImageExts = new(StringComparer.OrdinalIgnoreCase)
         { ".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".gif", ".webp" };
 
+        // ─────────────────────────────────────────────────────────────────────
+        //  D L L   (NOWA SYGNATURA: width, linesForThread, stride, startY)
+        // ─────────────────────────────────────────────────────────────────────
         [DllImport(@"C:\Users\MSI\source\repos\GaussianBlur\x64\Release\DllAsm.dll",
-           CallingConvention = CallingConvention.StdCall)]
-        private static extern void MyProc1(IntPtr imagePtr, int width, int height, int stride);
+            CallingConvention = CallingConvention.StdCall)]
+        private static extern void MyProc1(
+    IntPtr imagePtr,
+    int width,
+    int stride,        // <-- R8D
+    int startY,        // <-- R9D
+    int linesForThread // <-- 5-ty (nieużywany w rejestrach, ale zaraz zobaczysz, że i tak go weźmiemy z R11)
+);
 
-        [DllImport(@"C:\Users\MSI\source\repos\GaussianBlur\x64\Release\DllC.dll")]
-        static extern int MyProc2(int a, int b);
         public MainWindow()
         {
-            InitializeComponent(); // łączy z XAML
+            InitializeComponent();
         }
 
-
-        private int[] getAmountOfLinesForThreadVector(int imageHeight, int numOfThreads)
+        // ─────────────────────────────────────────────────────────────────────
+        //  PODZIAŁ WYSOKOŚCI NA WĄTKI  → [base, base, …] + reszta
+        //  i aktualizacja tbLines
+        // ─────────────────────────────────────────────────────────────────────
+        private int[] BuildLinesVector(int imageHeight, int numThreads)
         {
-            if (numOfThreads <= 0)
-                throw new ArgumentOutOfRangeException(nameof(numOfThreads));
+            if (numThreads <= 0) throw new ArgumentOutOfRangeException(nameof(numThreads));
 
-            var lines = new int[numOfThreads];
-
-            // bazowa liczba linii i reszta do „rozdania”
-            int baseLines = Math.DivRem(imageHeight, numOfThreads, out int rest);
-
-            for (int i = 0; i < numOfThreads; i++)
-                lines[i] = baseLines + (i < rest ? 1 : 0);
+            int baseLines = Math.DivRem(imageHeight, numThreads, out int rest);
+            var lines = Enumerable.Range(0, numThreads)
+                                  .Select(i => baseLines + (i < rest ? 1 : 0))
+                                  .ToArray();
 
             tbLines.Text = $"[{string.Join(", ", lines)}]";
+            tbLines.Text += " h: "+imageHeight;
             return lines;
         }
 
+        // sumy prefixowe startY dla wątków
+        private static int[] BuildStartRows(int[] linesPerThread)
+        {
+            var startRows = new int[linesPerThread.Length];
+            int acc = 0;
+            for (int i = 0; i < linesPerThread.Length; i++)
+            {
+                startRows[i] = acc;
+                acc += linesPerThread[i];
+            }
+            return startRows;
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        //  WYBÓR FOLDERU
+        // ─────────────────────────────────────────────────────────────────────
         private void btnChooseFolder_Click(object sender, RoutedEventArgs e)
         {
-
             using var dlg = new WinForms.FolderBrowserDialog
             {
                 Description = "Wybierz folder z obrazami do przetworzenia"
@@ -63,99 +86,128 @@ namespace GaussianBlur
             {
                 _imagesFolder = dlg.SelectedPath;
 
-                // Szybkie liczenie tylko w bieżącym folderze (bez podfolderów)
                 _imageCount = Directory.EnumerateFiles(_imagesFolder, "*.*", SearchOption.TopDirectoryOnly)
                                        .Count(p => ImageExts.Contains(Path.GetExtension(p)));
 
-                System.Windows.MessageBox.Show($"Wybrano folder:\n{_imagesFolder}\n\nLiczba obrazów: {_imageCount}",
-                               "Folder wybrany",
-                               MessageBoxButton.OK, MessageBoxImage.Information);
-                // jeśli chcesz gdzieś pokazać wynik w UI, np. w TextBlock:
-                tbFilePath.Text = $"Folder: {_imagesFolder}  |  Plików: {_imageCount}";
+                tbFilePath.Text = $"Folder: {_imagesFolder}   |   Plików: {_imageCount}";
+                tbLines.Text = ""; // wyczyść
 
-                if (_imageCount > 0)
+                // Jeśli chcesz od razu policzyć podział wierszy używając pierwszego obrazka:
+                var first = Directory.EnumerateFiles(_imagesFolder, "*.*")
+                                     .FirstOrDefault(f => ImageExts.Contains(Path.GetExtension(f)));
+                if (first != null)
                 {
-                    //  policz linie od razu po wybraniu folderu
-                    int numOfThreads = Environment.ProcessorCount;
-
-                    // otwórz pierwszy obraz, żeby znać wysokość
-                    var firstImage = Directory.EnumerateFiles(_imagesFolder, "*.*")
-                                              .FirstOrDefault(f => ImageExts.Contains(Path.GetExtension(f)));
-
-                    if (firstImage != null)
-                    {
-                        using var bmp = new System.Drawing.Bitmap(firstImage);
-                        getAmountOfLinesForThreadVector(bmp.Height, numOfThreads);
-                    }
+                    // pobierz wymiary pierwszego obrazka
+                    using var tmp = new Bitmap(first);
+                    int threads = Environment.ProcessorCount;
+                    var lines = BuildLinesVector(tmp.Height, threads);
+                    // wynik trafi do tbLines w BuildLinesVector
                 }
-                else
-                {
-                    tbLines.Text = "Brak obrazów w folderze.";
-                }
-
             }
         }
 
-        private void btnChooseCDll_Click(object sender, RoutedEventArgs e)
+        // jeśli masz 2 przyciski C/ASM — tu się przełącza:
+        private void btnChooseAsmDll_Click(object sender, RoutedEventArgs e) => asmChoice = true;
+        private void btnChooseCDll_Click(object sender, RoutedEventArgs e) => asmChoice = false; // (nie używamy tu C)
+
+        // ─────────────────────────────────────────────────────────────────────
+        //  PRZETWARZANIE PO KLIKNIĘCIU RUN
+        // ─────────────────────────────────────────────────────────────────────
+        private async void btnRunProcessing_Click(object sender, RoutedEventArgs e)
         {
-            cChoice = !cChoice;
-            if (cChoice)
+            if (_imageCount == 0 || !Directory.Exists(_imagesFolder))
             {
-                asmChoice = false;
-                btnChooseCDll.Background = System.Windows.Media.Brushes.LightCyan;
-                btnChooseAsmDll.Background = System.Windows.Media.Brushes.LightGray;
-            }
-            else btnChooseCDll.Background = System.Windows.Media.Brushes.LightGray;
-        }
-
-        private void btnChooseAsmDll_Click(object sender, RoutedEventArgs e)
-        {
-            asmChoice = !asmChoice;
-
-            if (asmChoice)
-            {
-                cChoice = false;
-                btnChooseAsmDll.Background = System.Windows.Media.Brushes.LightCyan;
-                btnChooseCDll.Background = System.Windows.Media.Brushes.LightGray;
-            }
-            else btnChooseAsmDll.Background = System.Windows.Media.Brushes.LightGray;
-
-        }
-        private void btnRunProcessing_Click(object sender, RoutedEventArgs e)
-        {
-            var firstImage = Directory.EnumerateFiles(_imagesFolder, "*.*")
-                                      .FirstOrDefault(f => ImageExts.Contains(Path.GetExtension(f)));
-
-            if (firstImage == null)
-            {
-                MessageBox.Show("No supported image found.");
+                MessageBox.Show("Wybierz folder z co najmniej jednym obrazem.", "Brak danych",
+                    MessageBoxButton.OK, MessageBoxImage.Warning);
                 return;
             }
 
-            using (var bmp = new System.Drawing.Bitmap(firstImage))
+            var firstImage = Directory.EnumerateFiles(_imagesFolder, "*.*")
+                                      .FirstOrDefault(f => ImageExts.Contains(Path.GetExtension(f)));
+            if (firstImage == null)
             {
-                //int numOfThreads = Environment.ProcessorCount;
-                var rect = new System.Drawing.Rectangle(0, 0, bmp.Width, bmp.Height);
-                //int[] lines = getAmountOfLinesForThreadVector(bmp.Height,numOfThreads);
-                var data = bmp.LockBits(rect,
-                    System.Drawing.Imaging.ImageLockMode.ReadWrite,
-                    System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+                MessageBox.Show("Nie znaleziono obsługiwanego obrazu w folderze.",
+                    "Błąd", MessageBoxButton.OK, MessageBoxImage.Error);
+                return;
+            }
 
-                IntPtr ptr = data.Scan0;
+            try
+            {
+                using var src = new Bitmap(firstImage);
 
-                // 🔧 Call the ASM function
-                MyProc1(ptr, bmp.Width, bmp.Height, data.Stride);
+                // GDI+ LockBits wymaga dokładnie 32bppArgb. Jeśli obraz jest inny — konwertujemy.
+                Bitmap bmp;
+                if (src.PixelFormat != PixelFormat.Format32bppArgb)
+                {
+                    bmp = new Bitmap(src.Width, src.Height, PixelFormat.Format32bppArgb);
+                    using var g = Graphics.FromImage(bmp);
+                    g.DrawImage(src, 0, 0, src.Width, src.Height);
+                }
+                else
+                {
+                    bmp = (Bitmap)src.Clone();
+                }
 
-                bmp.UnlockBits(data);
+                using (bmp)
+                {
+                    int numThreads = Environment.ProcessorCount;
+                    var rect = new Rectangle(0, 0, bmp.Width, bmp.Height);
 
-                string outPath = Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.Desktop),
-                    "processed_center_red.png");
-                bmp.Save(outPath, System.Drawing.Imaging.ImageFormat.Png);
+                    // Podział pracy na wątki
+                    var linesPerThread = BuildLinesVector(bmp.Height, numThreads);
+                    var startRows = BuildStartRows(linesPerThread);
 
-                MessageBox.Show($"Saved:\n{outPath}");
+                    // Zablokuj pamięć pikseli
+                    var data = bmp.LockBits(rect, ImageLockMode.ReadWrite, PixelFormat.Format32bppArgb);
+                    try
+                    {
+                        IntPtr basePtr = data.Scan0;
+                        int stride = data.Stride;
+
+                        if (!asmChoice)
+                        {
+                            MessageBox.Show("Wybierz DLL: ASM.", "Info",
+                                MessageBoxButton.OK, MessageBoxImage.Information);
+                            return;
+                        }
+
+                        // Zadania równoległe – każdy wątek dostaje swój pasek wierszy
+                        var tasks = new List<Task>(numThreads);
+                        for (int i = 0; i < numThreads; i++)
+                        {
+                            int lines = linesPerThread[i];
+                            int startY = startRows[i];
+
+                            if (lines <= 0) continue; // nic do roboty (może się zdarzyć przy bardzo niskich obrazach)
+
+                            tasks.Add(Task.Run(() =>
+                            {
+                                // Wywołanie ASM: zapisuje TYLKO własny zakres
+                                MyProc1(basePtr, bmp.Width, stride, startY, lines);
+                            }));
+                        }
+
+                        await Task.WhenAll(tasks);
+                    }
+                    finally
+                    {
+                        bmp.UnlockBits(data);
+                    }
+
+                    // Zapis
+                    var outPath = Path.Combine(
+                        Environment.GetFolderPath(Environment.SpecialFolder.Desktop),
+                        $"processed_{DateTime.Now:HHmmss}.png");
+                    bmp.Save(outPath, ImageFormat.Png);
+
+                    MessageBox.Show($"Saved:\n{outPath}", "OK", MessageBoxButton.OK, MessageBoxImage.Information);
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Processing failed:\n{ex.Message}", "Error",
+                    MessageBoxButton.OK, MessageBoxImage.Error);
             }
         }
-
     }
 }
