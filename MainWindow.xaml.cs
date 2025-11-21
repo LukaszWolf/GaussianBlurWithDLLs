@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
@@ -15,36 +16,77 @@ namespace GaussianBlur
 {
     public partial class MainWindow : Window
     {
-        private bool asmChoice = true;  // jeśli masz przełączniki C/ASM, ustawisz to przy kliknięciu
+        private bool asmChoice = false;
+        private bool cChoice = false;
         private string _imagesFolder = string.Empty;
         private int _imageCount = 0;
+        int threads = Environment.ProcessorCount;
+        long time;
 
-        // Obsługiwane rozszerzenia obrazów
         private static readonly HashSet<string> ImageExts = new(StringComparer.OrdinalIgnoreCase)
         { ".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".gif", ".webp" };
 
-        // ─────────────────────────────────────────────────────────────────────
-        //  D L L   (NOWA SYGNATURA: width, linesForThread, stride, startY)
-        // ─────────────────────────────────────────────────────────────────────
+        // ASM – in-place (np. rozjaśnianie)
+        //    [DllImport(@"C:\Users\MSI\source\repos\GaussianBlur\x64\Release\DllAsm.dll",
+        //    CallingConvention = CallingConvention.StdCall)]
+        //    private static extern void MyProc1(
+        //    IntPtr src,          // RCX
+        //    IntPtr dst,          // RDX
+        //    int width,           // R8D
+        //    int height,          // R9D
+        //    int stride,          // [rsp+40]
+        //    int startY,          // [rsp+48]
+        //    int linesForThread   // [rsp+50]
+        //);
         [DllImport(@"C:\Users\MSI\source\repos\GaussianBlur\x64\Release\DllAsm.dll",
             CallingConvention = CallingConvention.StdCall)]
-        private static extern void MyProc1(
-    IntPtr imagePtr,
-    int width,
-    int stride,        // <-- R8D
-    int startY,        // <-- R9D
-    int linesForThread // <-- 5-ty (nieużywany w rejestrach, ale zaraz zobaczysz, że i tak go weźmiemy z R11)
-);
+        public static extern void GaussianBlur5x5asm(
+        IntPtr src,
+        IntPtr dst,
+        int width,
+        int height,
+        int stride,
+        int startY,
+        int lines
+    );
+
+        // C – prawdziwy Gaussian blur 5x5: SRC -> DST
+        [DllImport(@"C:\Users\MSI\source\repos\GaussianBlur\x64\Release\DllC.dll",
+            CallingConvention = CallingConvention.Cdecl,
+            EntryPoint = "GaussianBlur5x5")] // >>> zmień na "MyProc2", jeśli tak eksportujesz w DLL
+        private static extern void GaussianBlur5x5(
+            IntPtr src,
+            IntPtr dst,
+            int width,
+            int height,
+            int stride,
+            int startY,
+            int linesForThread);
 
         public MainWindow()
         {
             InitializeComponent();
         }
 
-        // ─────────────────────────────────────────────────────────────────────
-        //  PODZIAŁ WYSOKOŚCI NA WĄTKI  → [base, base, …] + reszta
-        //  i aktualizacja tbLines
-        // ─────────────────────────────────────────────────────────────────────
+        private void tbThreadCount_TextChanged(object sender, TextChangedEventArgs e)
+        {
+            if (!int.TryParse(tbThreadCount.Text, out int value))
+                return;
+
+            if (value < 1) value = 1;
+            if (value > 64) value = 64;
+
+            threads = value;
+            RebuildLinesPreviewIfPossible();
+
+            string fixedText = value.ToString();
+            if (tbThreadCount.Text != fixedText)
+            {
+                tbThreadCount.Text = fixedText;
+                tbThreadCount.CaretIndex = tbThreadCount.Text.Length;
+            }
+        }
+
         private int[] BuildLinesVector(int imageHeight, int numThreads)
         {
             if (numThreads <= 0) throw new ArgumentOutOfRangeException(nameof(numThreads));
@@ -54,12 +96,23 @@ namespace GaussianBlur
                                   .Select(i => baseLines + (i < rest ? 1 : 0))
                                   .ToArray();
 
-            tbLines.Text = $"[{string.Join(", ", lines)}]";
-            tbLines.Text += " h: "+imageHeight;
+            tbLines.Text = $"[{string.Join(", ", lines)}] h: {imageHeight}";
             return lines;
         }
 
-        // sumy prefixowe startY dla wątków
+        private void RebuildLinesPreviewIfPossible()
+        {
+            if (string.IsNullOrEmpty(_imagesFolder) || !Directory.Exists(_imagesFolder))
+                return;
+
+            var first = Directory.EnumerateFiles(_imagesFolder, "*.*")
+                                 .FirstOrDefault(f => ImageExts.Contains(Path.GetExtension(f)));
+            if (first == null) return;
+
+            using var tmp = new Bitmap(first);
+            BuildLinesVector(tmp.Height, threads);
+        }
+
         private static int[] BuildStartRows(int[] linesPerThread)
         {
             var startRows = new int[linesPerThread.Length];
@@ -72,9 +125,6 @@ namespace GaussianBlur
             return startRows;
         }
 
-        // ─────────────────────────────────────────────────────────────────────
-        //  WYBÓR FOLDERU
-        // ─────────────────────────────────────────────────────────────────────
         private void btnChooseFolder_Click(object sender, RoutedEventArgs e)
         {
             using var dlg = new WinForms.FolderBrowserDialog
@@ -90,35 +140,42 @@ namespace GaussianBlur
                                        .Count(p => ImageExts.Contains(Path.GetExtension(p)));
 
                 tbFilePath.Text = $"Folder: {_imagesFolder}   |   Plików: {_imageCount}";
-                tbLines.Text = ""; // wyczyść
+                tbLines.Text = "";
 
-                // Jeśli chcesz od razu policzyć podział wierszy używając pierwszego obrazka:
                 var first = Directory.EnumerateFiles(_imagesFolder, "*.*")
                                      .FirstOrDefault(f => ImageExts.Contains(Path.GetExtension(f)));
                 if (first != null)
                 {
-                    // pobierz wymiary pierwszego obrazka
                     using var tmp = new Bitmap(first);
-                    int threads = Environment.ProcessorCount;
-                    var lines = BuildLinesVector(tmp.Height, threads);
-                    // wynik trafi do tbLines w BuildLinesVector
+                    BuildLinesVector(tmp.Height, threads);
                 }
             }
         }
 
-        // jeśli masz 2 przyciski C/ASM — tu się przełącza:
-        private void btnChooseAsmDll_Click(object sender, RoutedEventArgs e) => asmChoice = true;
-        private void btnChooseCDll_Click(object sender, RoutedEventArgs e) => asmChoice = false; // (nie używamy tu C)
+        private void btnChooseAsmDll_Click(object sender, RoutedEventArgs e)
+        {
+            btnChooseAsmDll.Background = System.Windows.Media.Brushes.LightBlue;
+            btnChooseCDll.Background = System.Windows.Media.Brushes.LightGray;
+            asmChoice = true;
+            cChoice = false;
+        }
 
-        // ─────────────────────────────────────────────────────────────────────
-        //  PRZETWARZANIE PO KLIKNIĘCIU RUN
-        // ─────────────────────────────────────────────────────────────────────
+        private void btnChooseCDll_Click(object sender, RoutedEventArgs e)
+        {
+            btnChooseAsmDll.Background = System.Windows.Media.Brushes.LightGray;
+            btnChooseCDll.Background = System.Windows.Media.Brushes.LightBlue;
+            asmChoice = false;
+            cChoice = true;
+        }
+
+        // =====================================================================
+        //  RUN – tu jest cała zmiana pod GaussianBlur5x5(src, dst, ...)
+        // =====================================================================
         private async void btnRunProcessing_Click(object sender, RoutedEventArgs e)
         {
             if (_imageCount == 0 || !Directory.Exists(_imagesFolder))
             {
-                MessageBox.Show("Wybierz folder z co najmniej jednym obrazem.", "Brak danych",
-                    MessageBoxButton.OK, MessageBoxImage.Warning);
+                MessageBox.Show("Wybierz folder z co najmniej jednym obrazem.");
                 return;
             }
 
@@ -126,88 +183,145 @@ namespace GaussianBlur
                                       .FirstOrDefault(f => ImageExts.Contains(Path.GetExtension(f)));
             if (firstImage == null)
             {
-                MessageBox.Show("Nie znaleziono obsługiwanego obrazu w folderze.",
-                    "Błąd", MessageBoxButton.OK, MessageBoxImage.Error);
+                MessageBox.Show("Nie znaleziono obsługiwanego obrazu.");
                 return;
             }
 
             try
             {
-                using var src = new Bitmap(firstImage);
+                using var srcBmpOrig = new Bitmap(firstImage);
 
-                // GDI+ LockBits wymaga dokładnie 32bppArgb. Jeśli obraz jest inny — konwertujemy.
-                Bitmap bmp;
-                if (src.PixelFormat != PixelFormat.Format32bppArgb)
+                // Wymuszenie 32bppArgb
+                Bitmap srcBmp;
+                if (srcBmpOrig.PixelFormat != PixelFormat.Format32bppArgb)
                 {
-                    bmp = new Bitmap(src.Width, src.Height, PixelFormat.Format32bppArgb);
-                    using var g = Graphics.FromImage(bmp);
-                    g.DrawImage(src, 0, 0, src.Width, src.Height);
+                    srcBmp = new Bitmap(srcBmpOrig.Width, srcBmpOrig.Height, PixelFormat.Format32bppArgb);
+                    using (var g = Graphics.FromImage(srcBmp))
+                        g.DrawImage(srcBmpOrig, 0, 0, srcBmpOrig.Width, srcBmpOrig.Height);
                 }
                 else
                 {
-                    bmp = (Bitmap)src.Clone();
+                    srcBmp = (Bitmap)srcBmpOrig.Clone();
                 }
 
-                using (bmp)
+                using (srcBmp)
+                using (var dstBmp = new Bitmap(srcBmp.Width, srcBmp.Height, PixelFormat.Format32bppArgb))
                 {
-                    int numThreads = Environment.ProcessorCount;
-                    var rect = new Rectangle(0, 0, bmp.Width, bmp.Height);
+                    int width = srcBmp.Width;
+                    int height = srcBmp.Height;
 
-                    // Podział pracy na wątki
-                    var linesPerThread = BuildLinesVector(bmp.Height, numThreads);
-                    var startRows = BuildStartRows(linesPerThread);
+                    var rect = new Rectangle(0, 0, width, height);
 
-                    // Zablokuj pamięć pikseli
-                    var data = bmp.LockBits(rect, ImageLockMode.ReadWrite, PixelFormat.Format32bppArgb);
+                    // Lock źródła (tylko do odczytu) i celu (tylko zapis)
+                    var srcData = srcBmp.LockBits(rect, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+                    var dstData = dstBmp.LockBits(rect, ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+
                     try
                     {
-                        IntPtr basePtr = data.Scan0;
-                        int stride = data.Stride;
+                        IntPtr srcPtr = srcData.Scan0;
+                        IntPtr dstPtr = dstData.Scan0;
+                        int stride = srcData.Stride;
 
-                        if (!asmChoice)
-                        {
-                            MessageBox.Show("Wybierz DLL: ASM.", "Info",
-                                MessageBoxButton.OK, MessageBoxImage.Information);
-                            return;
-                        }
+                        int numThreads = threads; // Twój wybór z GUI
+                        var linesPerThread = BuildLinesVector(height, numThreads);
+                        var startRows = BuildStartRows(linesPerThread);
 
-                        // Zadania równoległe – każdy wątek dostaje swój pasek wierszy
                         var tasks = new List<Task>(numThreads);
+                        System.Diagnostics.Stopwatch sw = Stopwatch.StartNew();
                         for (int i = 0; i < numThreads; i++)
                         {
                             int lines = linesPerThread[i];
                             int startY = startRows[i];
 
-                            if (lines <= 0) continue; // nic do roboty (może się zdarzyć przy bardzo niskich obrazach)
+                            if (lines <= 0)
+                                continue;
 
                             tasks.Add(Task.Run(() =>
                             {
-                                // Wywołanie ASM: zapisuje TYLKO własny zakres
-                                MyProc1(basePtr, bmp.Width, stride, startY, lines);
+                                if (asmChoice)
+                                    GaussianBlur5x5asm(srcPtr, dstPtr, width, height, stride, startY, lines);
+                                else
+                                    GaussianBlur5x5(srcPtr, dstPtr, width, height, stride, startY, lines);
                             }));
                         }
 
                         await Task.WhenAll(tasks);
+                        sw.Stop();
+                        time = sw.ElapsedMilliseconds;
                     }
                     finally
                     {
-                        bmp.UnlockBits(data);
+                        srcBmp.UnlockBits(srcData);
+                        dstBmp.UnlockBits(dstData);
                     }
 
-                    // Zapis
-                    var outPath = Path.Combine(
+                    string outPath = Path.Combine(
                         Environment.GetFolderPath(Environment.SpecialFolder.Desktop),
-                        $"processed_{DateTime.Now:HHmmss}.png");
-                    bmp.Save(outPath, ImageFormat.Png);
+                        $"processed{DateTime.Now:HHmmss}.png");
 
-                    MessageBox.Show($"Saved:\n{outPath}", "OK", MessageBoxButton.OK, MessageBoxImage.Information);
+                    dstBmp.Save(outPath, ImageFormat.Png);
+                    MessageBox.Show($"Zapisano:\n{outPath}\n Czas przetwarzania: {time} ms");
+                    
                 }
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"Processing failed:\n{ex.Message}", "Error",
-                    MessageBoxButton.OK, MessageBoxImage.Error);
+                MessageBox.Show($"Błąd przetwarzania:\n{ex.Message}");
             }
+        }
+
+
+        private void btnThreadsMinus_Click(object sender, RoutedEventArgs e)
+        {
+            if (threads > 1)
+                threads--;
+
+            tbThreadCount.Text = threads.ToString();
+            RebuildLinesPreviewIfPossible();
+            if (threads == 64)
+                btnThreadsPlus.Background = System.Windows.Media.Brushes.Red;
+            else
+                btnThreadsPlus.Background = System.Windows.Media.Brushes.LightGray;
+
+            if (threads == 1)
+                btnThreadsMinus.Background = System.Windows.Media.Brushes.Red;
+            else
+                btnThreadsMinus.Background = System.Windows.Media.Brushes.LightGray;
+        }
+
+        private void btnThreadsPlus_Click(object sender, RoutedEventArgs e)
+        {
+            if (threads < 64)
+                threads++;
+
+            tbThreadCount.Text = threads.ToString();
+            RebuildLinesPreviewIfPossible();
+            if (threads == 64)
+                btnThreadsPlus.Background = System.Windows.Media.Brushes.Red;
+            else
+                btnThreadsPlus.Background = System.Windows.Media.Brushes.LightGray;
+
+            if (threads == 1)
+                btnThreadsMinus.Background = System.Windows.Media.Brushes.Red;
+            else
+                btnThreadsMinus.Background = System.Windows.Media.Brushes.LightGray;
+        }
+
+        private void btnThreadsHw_Click(object sender, RoutedEventArgs e)
+        {
+            threads = Environment.ProcessorCount;
+            tbThreadCount.Text = threads.ToString();
+            RebuildLinesPreviewIfPossible();
+
+            if (threads == 64)
+                btnThreadsPlus.Background = System.Windows.Media.Brushes.Red;
+            else
+                btnThreadsPlus.Background = System.Windows.Media.Brushes.LightGray;
+
+            if (threads == 1)
+                btnThreadsMinus.Background = System.Windows.Media.Brushes.Red;
+            else
+                btnThreadsMinus.Background = System.Windows.Media.Brushes.LightGray;
         }
     }
 }

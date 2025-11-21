@@ -1,2 +1,2 @@
 LIBRARY DllAsm
-EXPORTS MyProc1
+EXPORTS GaussianBlur5x5asm
